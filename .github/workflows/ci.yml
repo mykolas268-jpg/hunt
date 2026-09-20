@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The rate limiter's correctness argument is that SELECT ... FOR UPDATE
+    # serialises concurrent claimants. A mocked database would assert the code
+    # rather than the behaviour, so CI runs a real Postgres.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hunt
+          POSTGRES_PASSWORD: hunt
+          POSTGRES_DB: hunt_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://hunt:hunt@localhost:5432/hunt_test?schema=public
+      ENCRYPTION_KEY: qDe0oMCkwYjJ9mJ3dYsSbLoJeF5vR7hN2xKpU4aTzQ8=
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - run: npx tsc --noEmit
+      - run: npm test
