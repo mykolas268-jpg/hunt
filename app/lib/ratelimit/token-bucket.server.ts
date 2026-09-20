@@ -3,13 +3,14 @@
  *
  * The supplier caps us at roughly one request per second PER MERCHANT ACCOUNT,
  * and we run multiple worker processes. An in-memory limiter would let each
- * process spend the same budget independently, so the bucket lives in Postgres
- * and every claim takes a row lock.
+ * process spend the same budget independently, so the bucket lives in Postgres.
  *
- * `SELECT ... FOR UPDATE` inside a transaction is what makes this correct:
- * concurrent workers serialise on the row, so two of them can never observe the
- * same token and both spend it. Without the lock this is a read-modify-write
- * race that looks fine in single-threaded tests and fails in production.
+ * Correctness rests on each claim being a single atomic UPDATE whose WHERE
+ * clause tests the balance. Concurrent workers serialise on the row inside that
+ * one statement, so two of them can never observe the same token and both spend
+ * it. Read the balance and write it back separately — even across two awaits in
+ * the same function — and this becomes a read-modify-write race that passes
+ * every single-threaded test and over-grants in production.
  */
 
 import type { PrismaClient } from "@prisma/client";
@@ -39,13 +40,6 @@ export interface AcquireResult {
   tokensRemaining: number;
 }
 
-interface BucketRow {
-  id: string;
-  tokens: number;
-  capacity: number;
-  refillPerSecond: number;
-  lastRefillAt: Date;
-}
 
 /** Create the bucket for an account if it does not exist yet. Idempotent. */
 export async function ensureBucket(
@@ -77,47 +71,64 @@ export async function tryAcquire(
   supplierAccountId: string,
   now: Date = new Date(),
 ): Promise<AcquireResult> {
-  return prisma.$transaction(async (tx) => {
-    const rows = await tx.$queryRaw<BucketRow[]>`
-      SELECT id, tokens, capacity, "refillPerSecond", "lastRefillAt"
-      FROM "RateBucket"
-      WHERE "supplierAccountId" = ${supplierAccountId}
-      FOR UPDATE
-    `;
+  // A single UPDATE, not an interactive transaction.
+  //
+  // The obvious implementation is SELECT ... FOR UPDATE inside a transaction,
+  // and it is correct — but it holds a connection for the whole round trip.
+  // With many workers contending for one merchant's bucket, that exhausts the
+  // Prisma connection pool and callers start failing on the transaction's
+  // maxWait rather than being rate limited. The failure is load-dependent, so
+  // it surfaces as an intermittent error under exactly the concurrency this
+  // module exists to handle.
+  //
+  // One UPDATE with the refill computed inline is atomic on its own. Postgres
+  // takes the row lock for the duration of the statement and, at READ
+  // COMMITTED, re-evaluates the WHERE clause against the committed row after
+  // acquiring it — so a concurrent claimant sees the decremented balance and
+  // cannot spend a token that is already gone. Same guarantee, no transaction,
+  // no pool pressure.
+  const granted = await prisma.$queryRaw<Array<{ tokensRemaining: number }>>`
+    UPDATE "RateBucket" AS b
+    SET tokens = LEAST(
+          b.capacity,
+          b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (${now}::timestamptz - b."lastRefillAt"))) * b."refillPerSecond"
+        ) - 1,
+        "lastRefillAt" = ${now}::timestamptz
+    WHERE b."supplierAccountId" = ${supplierAccountId}
+      AND LEAST(
+            b.capacity,
+            b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (${now}::timestamptz - b."lastRefillAt"))) * b."refillPerSecond"
+          ) >= 1
+    RETURNING b.tokens AS "tokensRemaining"
+  `;
 
-    const bucket = rows[0];
-    if (!bucket) {
-      throw new Error(
-        `No rate bucket for supplier account ${supplierAccountId}. Call ensureBucket() on connect.`,
-      );
-    }
+  if (granted[0]) {
+    return { granted: true, retryAfterMs: 0, tokensRemaining: granted[0].tokensRemaining };
+  }
 
-    const elapsedSeconds = Math.max(0, (now.getTime() - bucket.lastRefillAt.getTime()) / 1000);
-    const refilled = Math.min(
-      bucket.capacity,
-      bucket.tokens + elapsedSeconds * bucket.refillPerSecond,
+  // Refused. Persist the partial refill anyway so elapsed time is not lost and
+  // the next caller sees an accurate balance.
+  const refused = await prisma.$queryRaw<Array<{ tokensRemaining: number; refillPerSecond: number }>>`
+    UPDATE "RateBucket" AS b
+    SET tokens = LEAST(
+          b.capacity,
+          b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (${now}::timestamptz - b."lastRefillAt"))) * b."refillPerSecond"
+        ),
+        "lastRefillAt" = ${now}::timestamptz
+    WHERE b."supplierAccountId" = ${supplierAccountId}
+    RETURNING b.tokens AS "tokensRemaining", b."refillPerSecond" AS "refillPerSecond"
+  `;
+
+  const state = refused[0];
+  if (!state) {
+    throw new Error(
+      `No rate bucket for supplier account ${supplierAccountId}. Call ensureBucket() on connect.`,
     );
+  }
 
-    if (refilled >= 1) {
-      const remaining = refilled - 1;
-      await tx.rateBucket.update({
-        where: { id: bucket.id },
-        data: { tokens: remaining, lastRefillAt: now },
-      });
-      return { granted: true, retryAfterMs: 0, tokensRemaining: remaining };
-    }
-
-    // Persist the partial refill even on refusal, so the elapsed time is not
-    // lost and the next caller sees an accurate balance.
-    await tx.rateBucket.update({
-      where: { id: bucket.id },
-      data: { tokens: refilled, lastRefillAt: now },
-    });
-
-    const deficit = 1 - refilled;
-    const retryAfterMs = Math.ceil((deficit / bucket.refillPerSecond) * 1000);
-    return { granted: false, retryAfterMs, tokensRemaining: refilled };
-  });
+  const deficit = 1 - state.tokensRemaining;
+  const retryAfterMs = Math.ceil((deficit / state.refillPerSecond) * 1000);
+  return { granted: false, retryAfterMs, tokensRemaining: state.tokensRemaining };
 }
 
 export interface AcquireOptions {

@@ -125,6 +125,22 @@ describe("concurrency — the reason this lives in Postgres", () => {
     expect(results.filter((r) => r.granted)).toHaveLength(1);
   });
 
+  it("holds up at a concurrency that exhausts a connection pool", async () => {
+    // The earlier implementation wrapped each claim in a Prisma interactive
+    // transaction. Forty concurrent claims exceed the default pool, so callers
+    // began failing on the transaction's maxWait instead of being rate
+    // limited — an intermittent error under exactly the load this module
+    // exists to handle. A single atomic UPDATE has no such ceiling.
+    await ensureBucket(prisma, accountId, { capacity: 5, refillPerSecond: 0.0001 });
+
+    const results = await Promise.all(
+      Array.from({ length: 40 }, () => tryAcquire(prisma, accountId)),
+    );
+
+    expect(results.filter((r) => r.granted)).toHaveLength(5);
+    expect(results.every((r) => Number.isFinite(r.tokensRemaining))).toBe(true);
+  });
+
   it("never over-grants across repeated concurrent bursts", async () => {
     await ensureBucket(prisma, accountId, { capacity: 3, refillPerSecond: 0.0001 });
 
