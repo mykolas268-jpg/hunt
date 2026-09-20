@@ -143,3 +143,18 @@ export function formatMinor(amountMinor: number, currency: string): string {
   const minor = String(abs % 100).padStart(2, "0");
   return `${sign}${major}.${minor} ${currency}`;
 }
+
+/**
+ * Render minor units as the decimal string Shopify's GraphQL API expects.
+ *
+ * Shopify money fields are `Decimal` scalars serialised as strings ("35.99").
+ * Sending a JSON number invites float representation problems on the wire for
+ * exactly the values that matter, so the conversion happens here, once, by
+ * integer division rather than by dividing and formatting a float.
+ */
+export function toDecimalString(amountMinor: number): string {
+  assertSafeInteger(amountMinor, "amountMinor");
+  const sign = amountMinor < 0 ? "-" : "";
+  const abs = Math.abs(amountMinor);
+  return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, "0")}`;
+}

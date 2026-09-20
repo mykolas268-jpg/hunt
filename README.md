@@ -16,19 +16,25 @@ it must be scaffolded with the Shopify CLI (see below).
 | Area | State |
 |---|---|
 | Data model + migrations | ✅ Implemented, migrated against Postgres |
-| Money / crypto primitives | ✅ Implemented, 54 tests |
-| Pricing engine | ✅ Implemented, 43 tests |
-| Supplier rate limiter | ✅ Implemented, 14 tests incl. real-Postgres concurrency |
+| Money / crypto primitives | ✅ Implemented, 57 tests |
+| Pricing engine + FX (ECB) | ✅ Implemented, 56 tests |
+| Supplier rate limiter | ✅ Implemented, 15 tests incl. 40-way concurrency |
 | CJ adapter | ⚠️ Implemented, 46 tests — **schemas unverified against the live API** |
 | AI listing + compliance | ✅ Implemented, 57 tests |
 | Shopify GraphQL client | ✅ Implemented, 18 tests |
-| Queue, worker, job handlers | ✅ Implemented |
-| FX rates (ECB) | ✅ Implemented, 13 tests |
+| Product push (`productSet`) | ✅ Implemented, 26 tests |
+| Webhook HMAC + intake | ✅ Implemented, 19 tests |
+| Billing quota enforcement | ✅ Implemented, 12 tests |
+| Queue, worker, all job handlers | ✅ Implemented, 17 tests |
 | **Shopify app shell / UI routes** | ❌ **Not built — needs `shopify app init`** |
-| Product push (`productSet`) | ❌ Not built |
-| Billing (Shopify App Pricing) | ❌ Not built |
+| Shopify App Pricing wiring | ❌ Not built — needs the app shell and Partner Dashboard |
 
-**251 tests passing.** `npm test`
+**323 tests passing.** `npm test`
+
+Everything except the UI layer is implemented. What remains genuinely requires
+the Shopify CLI and a Partner account: the embedded app shell, the Polaris
+screens, and the Partner Dashboard plan configuration. The quota logic those
+screens enforce is already here and tested.
 
 ## Two things to do before trusting any of this
 
