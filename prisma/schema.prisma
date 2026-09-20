@@ -1,0 +1,520 @@
+// Data model for `hunt` — EU dropshipping listing app.
+//
+// Two conventions are load-bearing and must not be relaxed:
+//   1. Money is ALWAYS an Int in minor units (cents) plus an ISO currency code.
+//      There is no Float or Decimal anywhere in this file. Pricing defects are
+//      silent and compound, so the type system forbids them.
+//   2. Listing (marketing copy) and ComplianceRecord (legal declarations) are
+//      separate tables. They have different provenance, liability and review
+//      lifecycles. Regenerating copy must be able to invalidate a compliance
+//      review, which is inexpressible if they share a row.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Shopify session storage. Owned by @shopify/shopify-app-react-router.
+// Do not add application columns here.
+// ---------------------------------------------------------------------------
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+
+  @@index([shop])
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Shop {
+  id              String    @id @default(cuid())
+  shopDomain      String    @unique
+  installedAt     DateTime  @default(now())
+  uninstalledAt   DateTime?
+  planHandle      String?
+  onboardingState String    @default("NEW")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  supplierAccounts   SupplierAccount[]
+  markets            Market[]
+  responsiblePersons ResponsiblePerson[]
+  pricingRules       PricingRule[]
+  products           Product[]
+  supplierProducts   SupplierProduct[]
+  changeEvents       SupplierChangeEvent[]
+  aiGenerations      AiGeneration[]
+
+  @@index([uninstalledAt])
+}
+
+// ---------------------------------------------------------------------------
+// Supplier credentials and cached upstream catalogue
+// ---------------------------------------------------------------------------
+
+enum SupplierProvider {
+  CJ
+}
+
+enum SupplierAccountStatus {
+  ACTIVE
+  INVALID
+  RATE_LIMITED
+}
+
+model SupplierAccount {
+  id       String           @id @default(cuid())
+  shopId   String
+  provider SupplierProvider @default(CJ)
+  email    String
+
+  // All three are AES-256-GCM ciphertext. Never logged, never sent to a client.
+  apiKeyEnc       String
+  accessTokenEnc  String?
+  refreshTokenEnc String?
+
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  lastAuthAt            DateTime?
+  status                SupplierAccountStatus @default(ACTIVE)
+  lastError             String?
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+
+  shop        Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  products    SupplierProduct[]
+  rateBucket  RateBucket?
+
+  @@unique([shopId, provider])
+  @@index([shopId])
+}
+
+model SupplierProduct {
+  id                String           @id @default(cuid())
+  shopId            String
+  supplierAccountId String
+  provider          SupplierProvider @default(CJ)
+  supplierProductId String
+  sourceUrl         String?
+
+  titleRaw       String
+  descriptionRaw String?
+  categoryPath   String?
+  weightGrams    Int?
+  imageUrls      String[]
+  rawPayload     Json
+
+  lastFetchedAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  shop     Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  account  SupplierAccount   @relation(fields: [supplierAccountId], references: [id], onDelete: Cascade)
+  variants SupplierVariant[]
+  products Product[]
+
+  @@unique([supplierAccountId, supplierProductId])
+  @@index([shopId])
+}
+
+model SupplierVariant {
+  id                String @id @default(cuid())
+  supplierProductId String
+  supplierVariantId String
+  sku               String?
+
+  // { "Color": "Red", "Size": "XL" } — option name to value.
+  optionValues Json
+
+  costMinor    Int
+  costCurrency String
+  stockQty     Int     @default(0)
+  weightGrams  Int?
+  imageUrl     String?
+
+  lastSeenAt     DateTime  @default(now())
+  discontinuedAt DateTime?
+
+  product   SupplierProduct     @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+  variantMaps ProductVariantMap[]
+  changeEvents SupplierChangeEvent[]
+
+  @@unique([supplierProductId, supplierVariantId])
+  @@index([supplierProductId])
+}
+
+// ---------------------------------------------------------------------------
+// Markets and GPSR compliance
+// ---------------------------------------------------------------------------
+
+model Market {
+  id                  String  @id @default(cuid())
+  shopId              String
+  countryCode         String // ISO 3166-1 alpha-2
+  languageCode        String // ISO 639-1
+  currencyCode        String // ISO 4217
+  vatRateBp           Int    @default(0) // basis points: 2100 == 21%
+  responsiblePersonId String?
+  isDefault           Boolean @default(false)
+  createdAt           DateTime @default(now())
+
+  shop              Shop               @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  responsiblePerson ResponsiblePerson? @relation(fields: [responsiblePersonId], references: [id], onDelete: SetNull)
+  listings          Listing[]
+  complianceRecords ComplianceRecord[]
+
+  @@unique([shopId, countryCode])
+  @@index([shopId])
+}
+
+/// The GPSR "Responsible Person": an EU-established entity accountable for the
+/// product. We store and surface it; we cannot BE it. Never imply otherwise.
+model ResponsiblePerson {
+  id          String   @id @default(cuid())
+  shopId      String
+  legalName   String
+  street      String
+  postalCode  String
+  city        String
+  countryCode String
+  email       String
+  phone       String?
+  createdAt   DateTime @default(now())
+
+  shop              Shop               @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  markets           Market[]
+  complianceRecords ComplianceRecord[]
+
+  @@index([shopId])
+}
+
+// ---------------------------------------------------------------------------
+// Merchant-facing product
+// ---------------------------------------------------------------------------
+
+enum ProductStatus {
+  DRAFT
+  GENERATING
+  READY
+  PUSHING
+  SYNCED
+  ERROR
+}
+
+model Product {
+  id                String        @id @default(cuid())
+  shopId            String
+  supplierProductId String
+  shopifyProductId  String?
+  pricingRuleId     String?
+  status            ProductStatus @default(DRAFT)
+  lastError         String?
+  lastPushedAt      DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  shop             Shop                  @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  supplierProduct  SupplierProduct       @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+  pricingRule      PricingRule?          @relation(fields: [pricingRuleId], references: [id], onDelete: SetNull)
+  variantMaps      ProductVariantMap[]
+  listings         Listing[]
+  complianceRecords ComplianceRecord[]
+  changeEvents     SupplierChangeEvent[]
+
+  @@unique([shopId, supplierProductId])
+  @@index([shopId, status])
+}
+
+/// The join that makes monitoring possible: supplier variant <-> Shopify variant.
+model ProductVariantMap {
+  id                     String @id @default(cuid())
+  productId              String
+  supplierVariantId      String
+  shopifyVariantId       String?
+  shopifyInventoryItemId String?
+
+  lastKnownCostMinor   Int?
+  lastPushedPriceMinor Int?
+  lastKnownStock       Int?
+  updatedAt            DateTime @updatedAt
+
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplierVariant SupplierVariant @relation(fields: [supplierVariantId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, supplierVariantId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Generated content — marketing copy
+// ---------------------------------------------------------------------------
+
+enum ListingStatus {
+  PENDING
+  GENERATED
+  APPROVED
+  PUBLISHED
+  FAILED
+}
+
+model Listing {
+  id        String @id @default(cuid())
+  productId String
+  marketId  String
+  locale    String
+
+  title           String?
+  descriptionHtml String?
+  bullets         Json? // string[]
+  seoTitle        String?
+  seoDescription  String?
+  tags            String[]
+  tonePreset      String  @default("professional")
+
+  status        ListingStatus @default(PENDING)
+  model         String?
+  promptVersion String?
+  generatedAt   DateTime?
+  humanEdited   Boolean       @default(false)
+  approvedAt    DateTime?
+  approvedBy    String?
+  lastError     String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  product       Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  market        Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  aiGenerations AiGeneration[]
+
+  @@unique([productId, marketId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Generated content — legal declarations. Separate lifecycle. Separate rules.
+// ---------------------------------------------------------------------------
+
+enum Completeness {
+  EMPTY
+  PARTIAL
+  COMPLETE
+}
+
+model ComplianceRecord {
+  id                  String  @id @default(cuid())
+  productId           String
+  marketId            String
+  responsiblePersonId String?
+
+  manufacturerName    String?
+  manufacturerAddress String?
+  manufacturerEmail   String?
+  productIdentifiers  Json?
+  warnings            String? // in the market's language
+  safetyInstructions  String? // in the market's language
+  careInstructions    String?
+  ageRestriction      String?
+  certifications      Json?
+
+  /// Per-field origin: SUPPLIER | MERCHANT | AI_DRAFT. An AI-drafted legal
+  /// declaration that nobody reviewed is a liability, so we track every field.
+  fieldProvenance Json?
+
+  completeness       Completeness @default(EMPTY)
+  merchantReviewedAt DateTime?
+  merchantReviewedBy String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  product           Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+  market            Market             @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  responsiblePerson ResponsiblePerson? @relation(fields: [responsiblePersonId], references: [id], onDelete: SetNull)
+
+  @@unique([productId, marketId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Pricing
+// ---------------------------------------------------------------------------
+
+enum Rounding {
+  NONE
+  END_99
+  END_95
+  NEAREST
+}
+
+enum VatHandling {
+  ADD_VAT
+  PRICE_IS_GROSS
+}
+
+model PricingRule {
+  id     String @id @default(cuid())
+  shopId String
+  name   String
+
+  multiplierBp          Int         @default(20000) // 20000 bp == 2.0x
+  fixedFeeMinor         Int         @default(0)
+  rounding              Rounding    @default(END_99)
+  compareAtMultiplierBp Int?
+  minMarginMinor        Int         @default(0)
+  includeShipping       Boolean     @default(false)
+  vatHandling           VatHandling @default(ADD_VAT)
+  isDefault             Boolean     @default(false)
+  createdAt             DateTime    @default(now())
+
+  shop     Shop        @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  tiers    PriceTier[]
+  products Product[]
+
+  @@index([shopId])
+}
+
+/// Cost-banded overrides. Cheap items usually need a higher multiplier than
+/// expensive ones to clear fixed per-order costs.
+model PriceTier {
+  id            String @id @default(cuid())
+  pricingRuleId String
+  minCostMinor  Int
+  maxCostMinor  Int?
+  multiplierBp  Int
+  fixedFeeMinor Int    @default(0)
+
+  pricingRule PricingRule @relation(fields: [pricingRuleId], references: [id], onDelete: Cascade)
+
+  @@index([pricingRuleId])
+}
+
+model FxRate {
+  id            String   @id @default(cuid())
+  baseCurrency  String
+  quoteCurrency String
+  rateBp        Int // basis points: 10850 == 1.0850
+  asOfDate      DateTime @db.Date
+  createdAt     DateTime @default(now())
+
+  @@unique([baseCurrency, quoteCurrency, asOfDate])
+  @@index([baseCurrency, quoteCurrency])
+}
+
+// ---------------------------------------------------------------------------
+// Monitoring — the retention loop
+// ---------------------------------------------------------------------------
+
+enum ChangeType {
+  COST_UP
+  COST_DOWN
+  STOCK_OUT
+  STOCK_IN
+  DISCONTINUED
+}
+
+enum ChangeStatus {
+  NEW
+  APPLIED
+  DISMISSED
+}
+
+model SupplierChangeEvent {
+  id                String       @id @default(cuid())
+  shopId            String
+  productId         String
+  supplierVariantId String
+  type              ChangeType
+  oldValue          String?
+  newValue          String?
+  detectedAt        DateTime     @default(now())
+  status            ChangeStatus @default(NEW)
+  appliedAt         DateTime?
+
+  shop            Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplierVariant SupplierVariant @relation(fields: [supplierVariantId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, status])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Operational
+// ---------------------------------------------------------------------------
+
+enum GenerationKind {
+  LISTING
+  COMPLIANCE
+}
+
+/// Cost ledger. Feeds both usage-based billing and honest unit economics.
+/// A row is written for every call, successful or not — failures cost money too.
+model AiGeneration {
+  id              String         @id @default(cuid())
+  shopId          String
+  listingId       String?
+  kind            GenerationKind
+  model           String
+  inputTokens     Int            @default(0)
+  outputTokens    Int            @default(0)
+  cacheReadTokens Int            @default(0)
+  costMicros      Int            @default(0) // USD millionths
+  latencyMs       Int            @default(0)
+  promptVersion   String
+  success         Boolean
+  errorCode       String?
+  createdAt       DateTime       @default(now())
+
+  shop    Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  listing Listing? @relation(fields: [listingId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, createdAt])
+}
+
+/// Token bucket state for supplier rate limiting. One row per supplier account,
+/// claimed with SELECT ... FOR UPDATE so concurrent workers cannot double-spend.
+model RateBucket {
+  id                String   @id @default(cuid())
+  supplierAccountId String   @unique
+  tokens            Float
+  capacity          Float
+  refillPerSecond   Float
+  lastRefillAt      DateTime @default(now())
+
+  supplierAccount SupplierAccount @relation(fields: [supplierAccountId], references: [id], onDelete: Cascade)
+}
+
+/// Idempotency guard. Shopify delivers webhooks AT LEAST ONCE; without the
+/// unique constraint on shopifyEventId you will double-process. Not theoretical.
+model WebhookEvent {
+  id              String    @id @default(cuid())
+  shopDomain      String
+  topic           String
+  shopifyEventId  String    @unique
+  payload         Json
+  receivedAt      DateTime  @default(now())
+  processedAt     DateTime?
+  error           String?
+
+  @@index([shopDomain, topic])
+}
